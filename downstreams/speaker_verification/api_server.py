@@ -216,6 +216,9 @@ def compute_embedding(audio: np.ndarray, sr: int) -> np.ndarray:
         if len(audio) == 0:
             raise ValueError("Audio array is empty")
         
+        if model is None:
+            raise RuntimeError("Model not initialized")
+        
         # Convert to tensor and add batch dimension
         audio_tensor = torch.from_numpy(audio).unsqueeze(0).float()
         audio_tensor = audio_tensor.to(device)
@@ -296,7 +299,8 @@ async def embed_audio(request: AudioRequest):
         
         # Load and preprocess audio
         logger.info("Processing audio file")
-        audio, sr = load_audio_from_bytes(audio_bytes, max_duration=request.max_duration_seconds)
+        max_dur = request.max_duration_seconds if request.max_duration_seconds is not None else 30.0
+        audio, sr = load_audio_from_bytes(audio_bytes, max_duration=max_dur)
         duration = len(audio) / sr
         
         # Compute embedding
@@ -328,7 +332,8 @@ async def embed_audio_batch(request: BatchAudioRequest):
             audio_bytes = download_audio(url)
             
             # Load and preprocess audio
-            audio, sr = load_audio_from_bytes(audio_bytes, max_duration=request.max_duration_seconds)
+            max_dur = request.max_duration_seconds if request.max_duration_seconds is not None else 30.0
+            audio, sr = load_audio_from_bytes(audio_bytes, max_duration=max_dur)
             duration = len(audio) / sr
             
             # Compute embedding
