@@ -3,3 +3,4 @@ uvicorn[standard]==0.24.0
 pydantic==2.5.0
 requests==2.31.0
 librosa==0.10.2.post1
+audioread==3.0.1
