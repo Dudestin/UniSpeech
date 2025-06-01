@@ -19,8 +19,15 @@ import warnings
 warnings.filterwarnings('ignore', message='.*__audioread_load.*', category=FutureWarning)
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
+
+# Set debug logging for troubleshooting
+# Uncomment the next line for more detailed logs
+# logger.setLevel(logging.DEBUG)
 
 # Initialize FastAPI app
 app = FastAPI(title="WavLM Embedding API", version="1.0.0")
@@ -99,9 +106,24 @@ def download_audio(url: str, max_size_mb: int = 100) -> bytes:
 
 def load_audio_from_bytes(audio_bytes: bytes, target_sr: int = 16000, max_duration: float = 30.0) -> tuple:
     """Load audio from bytes and convert to 16kHz mono"""
-    with tempfile.NamedTemporaryFile(suffix='.tmp', delete=False) as tmp_file:
+    # Try to detect file format from magic bytes
+    file_ext = '.tmp'
+    if len(audio_bytes) > 11:
+        # Check for M4A/MP4 magic bytes
+        if audio_bytes[4:8] == b'ftyp':
+            file_ext = '.m4a'
+        # Check for MP3 magic bytes
+        elif audio_bytes[:3] == b'ID3' or (audio_bytes[:2] == b'\xff\xfb'):
+            file_ext = '.mp3'
+        # Check for WAV magic bytes
+        elif audio_bytes[:4] == b'RIFF':
+            file_ext = '.wav'
+    
+    with tempfile.NamedTemporaryFile(suffix=file_ext, delete=False) as tmp_file:
         tmp_file.write(audio_bytes)
         tmp_path = tmp_file.name
+    
+    logger.debug(f"Saved audio to temporary file: {tmp_path} (detected extension: {file_ext})")
     
     try:
         audio = None
@@ -120,9 +142,20 @@ def load_audio_from_bytes(audio_bytes: bytes, target_sr: int = 16000, max_durati
                 audio, sr = librosa.load(tmp_path, sr=None, mono=True)
                 logger.debug(f"Successfully loaded with librosa: {audio.shape}, sr={sr}")
             except Exception as librosa_error:
+                import traceback
+                librosa_traceback = traceback.format_exc()
+                logger.error(f"Librosa failed with traceback:\n{librosa_traceback}")
+                
+                # Try to provide more helpful error message
+                error_msg = str(librosa_error) if str(librosa_error) else "Unknown librosa error"
+                if "ffmpeg" in librosa_traceback.lower():
+                    error_msg = "FFmpeg error - audio format may not be supported or ffmpeg is not properly installed"
+                elif "audioread" in librosa_traceback.lower():
+                    error_msg = "Audioread error - audio format may not be supported"
+                
                 raise HTTPException(
                     status_code=400, 
-                    detail=f"Failed to load audio file. Soundfile error: {sf_error}. Librosa error: {librosa_error}"
+                    detail=f"Failed to load audio file. Soundfile error: {sf_error}. Librosa error: {error_msg}"
                 )
         
         # Validate audio was loaded
@@ -212,6 +245,45 @@ def compute_embedding(audio: np.ndarray, sr: int) -> np.ndarray:
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "model_loaded": model is not None}
+
+
+@app.get("/debug/info")
+async def debug_info():
+    """Debug endpoint to check system configuration"""
+    import subprocess
+    
+    info = {
+        "model_loaded": model is not None,
+        "torch_version": torch.__version__,
+        "librosa_version": librosa.__version__,
+        "soundfile_version": sf.__version__,
+    }
+    
+    # Check ffmpeg
+    try:
+        result = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=5)
+        info["ffmpeg_available"] = result.returncode == 0
+        info["ffmpeg_version"] = result.stdout.split('\n')[0] if result.returncode == 0 else "Not found"
+    except Exception as e:
+        info["ffmpeg_available"] = False
+        info["ffmpeg_error"] = str(e)
+    
+    # Check audioread backends
+    try:
+        import audioread
+        info["audioread_version"] = audioread.__version__
+        backends = []
+        if hasattr(audioread, 'ffdec') and audioread.ffdec.available():
+            backends.append("ffmpeg")
+        if hasattr(audioread, 'gstdec') and audioread.gstdec.available():
+            backends.append("gstreamer")
+        if hasattr(audioread, 'maddec') and audioread.maddec.available():
+            backends.append("mad")
+        info["audioread_backends"] = backends
+    except Exception as e:
+        info["audioread_error"] = str(e)
+    
+    return info
 
 
 @app.post("/embed", response_model=EmbeddingResponse)
