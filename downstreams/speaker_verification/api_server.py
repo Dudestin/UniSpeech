@@ -14,6 +14,10 @@ from torchaudio.transforms import Resample
 import librosa
 from models.ecapa_tdnn import ECAPA_TDNN_SMALL
 import logging
+import warnings
+
+# Suppress the librosa FutureWarning about deprecated __audioread_load
+warnings.filterwarnings('ignore', message='.*__audioread_load.*', category=FutureWarning)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -101,16 +105,48 @@ def load_audio_from_bytes(audio_bytes: bytes, target_sr: int = 16000, max_durati
         tmp_path = tmp_file.name
     
     try:
+        audio = None
+        sr = None
+        
         # Try soundfile first (for wav files)
         try:
+            logger.debug("Attempting to load audio with soundfile")
             audio, sr = sf.read(tmp_path)
-        except:
+            logger.debug(f"Successfully loaded with soundfile: {audio.shape}, sr={sr}")
+        except Exception as sf_error:
+            logger.debug(f"Soundfile failed: {sf_error}")
             # Fall back to librosa for other formats (mp3, m4a, etc.)
-            audio, sr = librosa.load(tmp_path, sr=None, mono=True)
+            try:
+                logger.debug("Attempting to load audio with librosa")
+                audio, sr = librosa.load(tmp_path, sr=None, mono=True)
+                logger.debug(f"Successfully loaded with librosa: {audio.shape}, sr={sr}")
+            except Exception as librosa_error:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Failed to load audio file. Soundfile error: {sf_error}. Librosa error: {librosa_error}"
+                )
+        
+        # Validate audio was loaded
+        if audio is None or len(audio) == 0:
+            raise HTTPException(status_code=400, detail="Audio file appears to be empty or corrupted")
+        
+        # Convert to numpy array if not already
+        if not isinstance(audio, np.ndarray):
+            audio = np.array(audio)
         
         # Convert to mono if stereo
         if len(audio.shape) > 1:
+            logger.debug(f"Converting stereo audio {audio.shape} to mono")
             audio = np.mean(audio, axis=1)
+        
+        # Ensure audio is float32
+        if audio.dtype != np.float32:
+            audio = audio.astype(np.float32)
+        
+        # Check minimum duration
+        duration_seconds = len(audio) / sr
+        if duration_seconds < 0.1:  # Less than 100ms
+            raise HTTPException(status_code=400, detail=f"Audio too short: {duration_seconds:.3f}s (minimum 0.1s)")
         
         # Clip audio if too long
         max_samples = int(max_duration * sr)
@@ -120,13 +156,21 @@ def load_audio_from_bytes(audio_bytes: bytes, target_sr: int = 16000, max_durati
         
         # Resample to 16kHz if needed
         if sr != target_sr:
+            logger.debug(f"Resampling from {sr}Hz to {target_sr}Hz")
             audio_tensor = torch.from_numpy(audio).float().unsqueeze(0)
             resampler = Resample(orig_freq=sr, new_freq=target_sr)
             audio_tensor = resampler(audio_tensor)
             audio = audio_tensor.squeeze(0).numpy()
             sr = target_sr
         
+        logger.debug(f"Final audio shape: {audio.shape}, sr={sr}, duration={len(audio)/sr:.2f}s")
         return audio, sr
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in audio processing: {e}")
+        raise HTTPException(status_code=500, detail=f"Audio processing failed: {str(e)}")
     finally:
         # Clean up temp file
         if os.path.exists(tmp_path):
@@ -135,18 +179,31 @@ def load_audio_from_bytes(audio_bytes: bytes, target_sr: int = 16000, max_durati
 
 def compute_embedding(audio: np.ndarray, sr: int) -> np.ndarray:
     """Compute embedding vector from audio"""
-    # Convert to tensor and add batch dimension
-    audio_tensor = torch.from_numpy(audio).unsqueeze(0).float()
-    audio_tensor = audio_tensor.to(device)
-    
-    # Compute embedding
-    with torch.no_grad():
-        embedding = model(audio_tensor)
-    
-    # Normalize embedding
-    embedding = F.normalize(embedding, p=2, dim=1)
-    
-    return embedding.cpu().numpy().squeeze()
+    try:
+        # Validate input
+        if len(audio) == 0:
+            raise ValueError("Audio array is empty")
+        
+        # Convert to tensor and add batch dimension
+        audio_tensor = torch.from_numpy(audio).unsqueeze(0).float()
+        audio_tensor = audio_tensor.to(device)
+        
+        logger.debug(f"Computing embedding for audio tensor shape: {audio_tensor.shape}")
+        
+        # Compute embedding
+        with torch.no_grad():
+            embedding = model(audio_tensor)
+        
+        # Normalize embedding
+        embedding = F.normalize(embedding, p=2, dim=1)
+        
+        result = embedding.cpu().numpy().squeeze()
+        logger.debug(f"Generated embedding shape: {result.shape}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error computing embedding: {e}")
+        raise HTTPException(status_code=500, detail=f"Embedding computation failed: {str(e)}")
 
 
 # Model is initialized before server startup in main()
@@ -167,12 +224,15 @@ async def embed_audio(request: AudioRequest):
         audio_bytes = download_audio(request.url)
         
         # Load and preprocess audio
+        logger.info("Processing audio file")
         audio, sr = load_audio_from_bytes(audio_bytes, max_duration=request.max_duration_seconds)
         duration = len(audio) / sr
         
         # Compute embedding
+        logger.info("Computing embedding")
         embedding = compute_embedding(audio, sr)
         
+        logger.info(f"Successfully processed audio: {duration:.2f}s, embedding dim: {len(embedding)}")
         return EmbeddingResponse(
             embedding=embedding.tolist(),
             audio_duration=duration,
@@ -181,8 +241,8 @@ async def embed_audio(request: AudioRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error processing audio: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error processing audio: {str(e)}")
+        logger.error(f"Unexpected error in embed_audio: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Unexpected error processing audio: {str(e)}")
 
 
 @app.post("/embed_batch", response_model=BatchEmbeddingResponse)
