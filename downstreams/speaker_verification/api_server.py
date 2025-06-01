@@ -7,7 +7,6 @@ import numpy as np
 from typing import List, Optional
 from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
 import uvicorn
 import requests
 from torchaudio.transforms import Resample
