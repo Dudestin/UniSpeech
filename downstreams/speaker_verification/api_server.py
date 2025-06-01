@@ -149,10 +149,7 @@ def compute_embedding(audio: np.ndarray, sr: int) -> np.ndarray:
     return embedding.cpu().numpy().squeeze()
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize model on startup"""
-    init_model()
+# Model is initialized before server startup in main()
 
 
 @app.get("/health")
@@ -226,6 +223,11 @@ async def embed_audio_batch(request: BatchAudioRequest):
 if __name__ == "__main__":
     # Get port from environment variable (for Cloud Run)
     port = int(os.environ.get("PORT", 8080))
+    
+    # Initialize model before starting server to avoid startup timeout
+    logger.info("Initializing model before starting server...")
+    init_model()
+    logger.info("Model initialization complete, starting server...")
     
     # Run the server
     uvicorn.run(app, host="0.0.0.0", port=port)
